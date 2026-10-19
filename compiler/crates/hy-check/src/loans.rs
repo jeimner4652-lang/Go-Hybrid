@@ -5814,7 +5814,7 @@ impl<'a> Checker<'a> {
 
     /// Resolve a write target to its `const` root. Fn-local and file-level
     /// all resolve through here (T22 / issue #37).
-    fn const_write_root(&self, st: &FnState, p: &Place) -> Option<String> {
+    pub(crate) fn const_write_root(&self, st: &FnState, p: &Place) -> Option<String> {
         match &p.kind {
             PlaceKind::Ident(name) => {
                 if name == "_" {
