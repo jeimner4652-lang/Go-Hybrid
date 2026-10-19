@@ -5496,19 +5496,40 @@ impl<'a> Checker<'a> {
                             let target = pre_alias_root
                                 .clone()
                                 .unwrap_or_else(|| root.to_string());
-                            st.aliases.insert(name.clone(), target);
+                            if target != *name {
+                                st.aliases.insert(name.clone(), target);
+                            }
                         }
                     } else if let Some(aroot) = &pre_alias_root {
-                        st.aliases.entry(name.clone()).or_insert_with(|| aroot.clone());
+                        if aroot != name {
+                            st.aliases.entry(name.clone()).or_insert_with(|| aroot.clone());
+                        }
                     }
                 }
                 if let Some(b) = st.env_lookup_mut(name) {
                     if !self_shadows_const {
-                        b.non_owned_origin = Some(format!(
-                            "range variable `{}` iterating `{}` (the collection still holds the element)",
-                            name,
-                            expr.render()
-                        ));
+                        if let Some(croot) = &pre_const_root {
+                            if may_share || is_ref || borrow_slot {
+                                b.non_owned_origin = Some(format!(
+                                    "range variable `{}` iterating `const {}` (`{}`)",
+                                    name,
+                                    croot,
+                                    expr.render()
+                                ));
+                            } else {
+                                b.non_owned_origin = Some(format!(
+                                    "range variable `{}` iterating `{}` (the collection still holds the element)",
+                                    name,
+                                    expr.render()
+                                ));
+                            }
+                        } else {
+                            b.non_owned_origin = Some(format!(
+                                "range variable `{}` iterating `{}` (the collection still holds the element)",
+                                name,
+                                expr.render()
+                            ));
+                        }
                     }
                 }
             }
