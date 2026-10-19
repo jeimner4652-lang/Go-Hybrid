@@ -440,7 +440,8 @@ impl<'a> Checker<'a> {
     }
 
     /// Extend any live `LoanTarget::MapSlot` window when a slot-loan binding
-    /// (or an existing alias of one) is copied into `alias_name` (`p := s` or `p = s`).
+    /// (or an existing alias of one) is copied, return-forwarded, or multi-value
+    /// unpacked into `alias_name` (`p := s`, `p := id(s)`, `p, ok := id_pair(s)`).
     pub(crate) fn extend_map_slot_loan_to_alias(
         &self,
         st: &mut FnState,
@@ -448,14 +449,35 @@ impl<'a> Checker<'a> {
         val: &Expr,
         idx: usize,
     ) {
-        let Expr::Ident { name: src, .. } = unwrap_parens(val) else {
+        if let Some(b) = self.lookup_binding(st, alias_name) {
+            if !b.shape.is_reference_alias() && !matches!(b.shape, TypeShape::Unknown) {
+                return;
+            }
+        }
+        let mut srcs: Vec<String> = Vec::new();
+        if let Expr::Ident { name: src, .. } = unwrap_parens(val) {
+            srcs.push(src.clone());
+        } else {
+            if let Some(aliased) = st.aliases.get(alias_name) {
+                srcs.push(aliased.clone());
+            }
+            if !self.call_returns_fresh_copy(st, val) {
+                collect_ref_roots(val, &mut srcs);
+            }
+        }
+        if srcs.is_empty() {
             return;
-        };
+        }
         let alias_last = st.last_use.get(alias_name).copied().unwrap_or(idx).max(idx);
-        let resolved_src = crate::freeze::resolve_alias(st, src);
+        let resolved_srcs: Vec<String> = srcs
+            .iter()
+            .map(|s| crate::freeze::resolve_alias(st, s))
+            .collect();
         for loan in &mut st.loans {
             if let LoanTarget::MapSlot { binding, .. } = &loan.target {
-                if (binding == src || *binding == resolved_src) && loan.created <= idx {
+                let matches_src = srcs.iter().any(|s| s == binding)
+                    || resolved_srcs.iter().any(|rs| rs == binding);
+                if matches_src && loan.created <= idx {
                     loan.last = loan.last.max(alias_last);
                 }
             }
@@ -1585,6 +1607,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.record_storage_from_snapshot(st, &pre_st, &info.name, &l.values[0], &overwritten, true, true);
+                self.extend_map_slot_loan_to_alias(st, &info.name, &l.values[0], idx);
                 if let Some(origin) = info.shadowed_origin {
                     if let Some(b) = st.env_lookup_mut(&info.name) {
                         if b.non_owned_origin.is_none() {
@@ -1831,6 +1854,7 @@ impl<'a> Checker<'a> {
                 // mutable GC storage with its source — so a later `move` of
                 // either must freeze the other (O5.2).
                 self.record_storage_from_snapshot(st, &pre_st, name, value, &overwritten, true, false);
+                self.extend_map_slot_loan_to_alias(st, name, value, idx);
                 self.record_move_const_and_a3_loans(st, name, value, idx);
                 // alias recording: `m2 := agg` (single-parent link, the
                 // friendlier "frozen alias" diagnostic) — and call results
@@ -5586,6 +5610,7 @@ impl<'a> Checker<'a> {
                         }
                     }
                     if !info.is_fresh_copy { self.record_storage_from_snapshot(st, &pre_st, name, v, &overwritten, false, false); }
+                    self.extend_map_slot_loan_to_alias(st, name, v, idx);
                     self.record_move_const_and_a3_loans(st, name, v, idx);
                     // rebind may create a fresh alias — ident copies AND
                     // call results that hand back argument storage (#38)
@@ -5730,6 +5755,7 @@ impl<'a> Checker<'a> {
                             }
                         }
                     }
+                    self.extend_map_slot_loan_to_alias(st, name, &values[0], idx);
                     if let Some(origin) = shadowed_origin {
                         if let Some(b) = st.env_lookup_mut(name) {
                             if b.non_owned_origin.is_none() {

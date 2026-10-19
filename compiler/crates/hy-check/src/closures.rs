@@ -1241,6 +1241,10 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                             ck.extend_map_slot_loan_to_alias(st, name, val, idx);
                         }
                     }
+                } else if l.values.len() == 1 && l.names.len() > 1 {
+                    for name in &l.names {
+                        ck.extend_map_slot_loan_to_alias(st, name, &l.values[0], idx);
+                    }
                 }
             }
             Stmt::Assign {
@@ -1271,6 +1275,15 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                             } else {
                                 ck.extend_map_slot_loan_to_alias(st, name, v, idx);
                             }
+                        }
+                    }
+                } else if *op == hy_syntax::AssignOp::Assign
+                    && values.len() == 1
+                    && targets.len() > 1
+                {
+                    for t in targets {
+                        if let hy_syntax::PlaceKind::Ident(name) = &t.kind {
+                            ck.extend_map_slot_loan_to_alias(st, name, &values[0], idx);
                         }
                     }
                 }

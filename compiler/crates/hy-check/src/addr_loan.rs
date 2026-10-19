@@ -33,23 +33,76 @@ fn is_slot_loan_expr(e: &Expr) -> bool {
 }
 
 impl<'a> Checker<'a> {
-    /// After `process_local`: flag every name bound to `&m[k]` (including
-    /// parenthesized `(&m[k])` and `&(m[k])`).
-    pub(crate) fn mark_slot_loans_local(&self, st: &mut FnState, l: &LocalDecl) {
-        if l.names.len() != l.values.len() {
-            return;
+    fn value_is_slot_loan_or_alias(&self, st: &FnState, name: &str, val: &Expr) -> bool {
+        if is_slot_loan_expr(val) {
+            return true;
         }
-        for (name, val) in l.names.iter().zip(l.values.iter()) {
-            if is_slot_loan_expr(val) {
-                if let Some(b) = st.env_lookup_mut(name) {
-                    b.slot_loan = true;
+        let Some(b) = self.lookup_binding(st, name) else {
+            return false;
+        };
+        if !b.shape.is_reference_alias() {
+            return false;
+        }
+        if let Some(src) = st.aliases.get(name) {
+            let root = crate::freeze::resolve_alias(st, src);
+            if self.lookup_binding(st, src).is_some_and(|sb| sb.slot_loan)
+                || self.lookup_binding(st, &root).is_some_and(|rb| rb.slot_loan)
+                || st.loans.iter().any(|l| {
+                    matches!(
+                        &l.target,
+                        crate::model::LoanTarget::MapSlot { binding, .. }
+                            if binding == src || binding == &root
+                    )
+                })
+            {
+                return true;
+            }
+        }
+        if self.call_returns_fresh_copy(st, val) {
+            return false;
+        }
+        let mut roots = Vec::new();
+        crate::model::collect_ref_roots(val, &mut roots);
+        roots.iter().any(|r| {
+            let root = crate::freeze::resolve_alias(st, r);
+            self.lookup_binding(st, r).is_some_and(|sb| sb.slot_loan)
+                || self.lookup_binding(st, &root).is_some_and(|rb| rb.slot_loan)
+                || st.loans.iter().any(|l| {
+                    matches!(
+                        &l.target,
+                        crate::model::LoanTarget::MapSlot { binding, .. }
+                            if binding == r || binding == &root
+                    )
+                })
+        })
+    }
+
+    /// After `process_local`: flag every name bound to `&m[k]` (including
+    /// parenthesized `(&m[k])` and `&(m[k])`), a copy of a slot loan, or a
+    /// return-forwarding call / multi-value unpack of one.
+    pub(crate) fn mark_slot_loans_local(&self, st: &mut FnState, l: &LocalDecl) {
+        if l.names.len() == l.values.len() {
+            for (name, val) in l.names.iter().zip(l.values.iter()) {
+                if self.value_is_slot_loan_or_alias(st, name, val) {
+                    if let Some(b) = st.env_lookup_mut(name) {
+                        b.slot_loan = true;
+                    }
+                }
+            }
+        } else if l.values.len() == 1 && l.names.len() > 1 {
+            for name in &l.names {
+                if self.value_is_slot_loan_or_alias(st, name, &l.values[0]) {
+                    if let Some(b) = st.env_lookup_mut(name) {
+                        b.slot_loan = true;
+                    }
                 }
             }
         }
     }
 
-    /// After `process_assign`: `x = &m[k]` makes `x` a slot loan; any other
-    /// plain re-assignment of a whole binding clears the flag.
+    /// After `process_assign`: `x = &m[k]` (or an alias/return-forwarding call
+    /// of a slot loan) makes `x` a slot loan; any other plain re-assignment of
+    /// a whole binding clears the flag.
     pub(crate) fn mark_slot_loans_assign(
         &self,
         st: &mut FnState,
@@ -57,14 +110,25 @@ impl<'a> Checker<'a> {
         op: AssignOp,
         values: &[hy_syntax::Expr],
     ) {
-        if op != AssignOp::Assign || targets.len() != values.len() {
+        if op != AssignOp::Assign {
             return;
         }
-        for (t, v) in targets.iter().zip(values.iter()) {
-            if let PlaceKind::Ident(name) = &t.kind {
-                let is_loan = is_slot_loan_expr(v);
-                if let Some(b) = st.env_lookup_mut(name) {
-                    b.slot_loan = is_loan;
+        if targets.len() == values.len() {
+            for (t, v) in targets.iter().zip(values.iter()) {
+                if let PlaceKind::Ident(name) = &t.kind {
+                    let is_loan = self.value_is_slot_loan_or_alias(st, name, v);
+                    if let Some(b) = st.env_lookup_mut(name) {
+                        b.slot_loan = is_loan;
+                    }
+                }
+            }
+        } else if values.len() == 1 && targets.len() > 1 {
+            for t in targets {
+                if let PlaceKind::Ident(name) = &t.kind {
+                    let is_loan = self.value_is_slot_loan_or_alias(st, name, &values[0]);
+                    if let Some(b) = st.env_lookup_mut(name) {
+                        b.slot_loan = is_loan;
+                    }
                 }
             }
         }
