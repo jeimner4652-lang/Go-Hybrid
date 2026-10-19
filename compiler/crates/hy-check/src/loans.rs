@@ -4652,11 +4652,11 @@ impl<'a> Checker<'a> {
                             }
                         }
                         Stmt::For {
-                            kind: ForKind::Iterate { vars, iter, .. },
+                            kind: hy_syntax::ForKind::Iterate { vars, expr },
                             ..
                         } => {
                             let (cur_a, cur_s, _) = scope_stack.last().unwrap();
-                            let cs = expr_const_origins(iter, cur_a, cur_s);
+                            let cs = expr_const_origins(expr, cur_a, cur_s);
                             let (aliases, shadowed, locals) = scope_stack.last_mut().unwrap();
                             for v in vars {
                                 if v == "_" {
@@ -4857,10 +4857,7 @@ impl<'a> Checker<'a> {
                             }
                         }
                         walk::ScopeEvent::MatchBind { name, subject } => {
-                            let (shape, ty) = match self.shape_of_expr(&cst, subject) {
-                                TypeShape::Option(inner) => (*inner, None),
-                                other => (other, None),
-                            };
+                            let (shape, ty) = self.match_bind_shape_and_ty(&cst, subject);
                             let mut s = HashSet::new();
                             {
                                 let (cur_o, cur_s, _) = scope_stack.last().unwrap();
@@ -4900,7 +4897,7 @@ impl<'a> Checker<'a> {
                                 let sh = if i == 0 {
                                     elem_shape.clone()
                                 } else {
-                                    TypeShape::Scalar
+                                    TypeShape::Primitive
                                 };
                                 self.define_binding(&mut cst, n, sh.clone(), None, false, false, false);
                                 locals.insert(n.clone());
@@ -5225,33 +5222,20 @@ impl<'a> Checker<'a> {
                     }
                 }
                 Stmt::For {
-                    kind: ForKind::Iterate { vars, iter, .. },
+                    kind: hy_syntax::ForKind::Iterate { vars, expr },
                     ..
                 } => {
-                    let iter_shape = self.shape_of_expr(&cst, iter);
+                    let shapes = self.iterate_var_shapes(&cst, expr, vars.len());
                     let mut base_o = HashSet::new();
                     {
                         let (origins, shadowed, _) = scope_stack.last().unwrap();
-                        self.collect_sharing_origins_expr(&cst, iter, origins, shadowed, &mut base_o);
+                        self.collect_sharing_origins_expr(&cst, expr, origins, shadowed, &mut base_o);
                     }
                     let (origins, shadowed, locals) = scope_stack.last_mut().unwrap();
-                    for (i, v) in vars.iter().enumerate() {
+                    for (v, var_shape) in vars.iter().zip(shapes) {
                         if v == "_" {
                             continue;
                         }
-                        let var_shape = match (&iter_shape, vars.len(), i) {
-                            (TypeShape::Slice(elem), 1, 0) => (**elem).clone(),
-                            (TypeShape::Slice(elem), _, 1) => (**elem).clone(),
-                            (TypeShape::Slice(_), _, 0) => TypeShape::Scalar,
-                            (TypeShape::Array(elem), 1, 0) => (**elem).clone(),
-                            (TypeShape::Array(elem), _, 1) => (**elem).clone(),
-                            (TypeShape::Array(_), _, 0) => TypeShape::Scalar,
-                            (TypeShape::Map(k, _), _, 0) => (**k).clone(),
-                            (TypeShape::Map(_, val), _, 1) => (**val).clone(),
-                            (TypeShape::Chan(elem), _, 0) => (**elem).clone(),
-                            (TypeShape::Unknown, _, _) => TypeShape::Unknown,
-                            _ => TypeShape::Scalar,
-                        };
                         self.define_binding(&mut cst, v, var_shape.clone(), None, false, false, false);
                         locals.insert(v.clone());
                         if self.shape_may_share(&var_shape)
@@ -9053,10 +9037,10 @@ fn main() {
     #[test]
     fn interprocedural_const_return_and_shared_return_respect_scopes_and_for_iterate() {
         let src_const_for = "\
-const SHARED = []map[string]int{{\"k\": 1}}
+const shared = []map[string]int{map[string]int{\"k\": 1}}
 
 fn leak_via_for() map[string]int {
-    for _, m in SHARED {
+    for _, m in shared {
         return m
     }
     return map[string]int{}
@@ -9073,14 +9057,14 @@ fn main() {
         );
 
         let src_const_branch_shadow = "\
-const SHARED = []map[string]int{{\"k\": 1}}
+const shared = []map[string]int{map[string]int{\"k\": 1}}
 
 fn leak_after_shadow(flag bool) []map[string]int {
     if flag {
-        SHARED := []map[string]int{{\"local\": 0}}
-        return SHARED
+        shared := []map[string]int{map[string]int{\"local\": 0}}
+        return shared
     }
-    return SHARED
+    return shared
 }
 
 fn main() {
@@ -9103,12 +9087,12 @@ fn pair_via_for(xs []map[string]int) (map[string]int, map[string]int) {
     return xs[0], xs[0]
 }
 
-fn worker(mut a map[string]int) {
+fn worker(a map[string]int) {
     a[\"k\"] = 2
 }
 
 fn main() {
-    xs := []map[string]int{{\"k\": 1}}
+    xs := []map[string]int{map[string]int{\"k\": 1}}
     a, b := pair_via_for(xs)
     task worker(move a)
     b[\"k\"] = 3
@@ -9120,21 +9104,25 @@ fn main() {
         );
 
         let src_a3_field_alias = "\
-struct holder {
-    m map[string]int
+struct svc {
+    count int
 }
 
-fn rehash_via_field(m map[string]int) {
+struct holder {
+    m map[string]svc
+}
+
+fn rehash_via_field(m map[string]svc) {
     var h holder
     h.m = m
-    h.m[\"other\"] = 99
+    h.m[\"other\"] = svc{count: 99}
 }
 
 fn main() {
-    m := map[string]int{\"k\": 1}
+    m := map[string]svc{\"k\": svc{count: 1}}
     p := &m[\"k\"]
     rehash_via_field(m)
-    println(*p)
+    p.count = 42
 }
 ";
         assert!(
@@ -9153,7 +9141,7 @@ struct ptr_holder {
     p *item
 }
 
-const ITEMS = map[string]item{\"k\": item{v: 1}}
+const items = map[string]item{\"k\": item{v: 1}}
 
 fn mutate_via_holder(m map[string]item) {
     h := ptr_holder{p: &m[\"k\"]}
@@ -9161,7 +9149,7 @@ fn mutate_via_holder(m map[string]item) {
 }
 
 fn main() {
-    mutate_via_holder(ITEMS)
+    mutate_via_holder(items)
 }
 ";
         assert!(
