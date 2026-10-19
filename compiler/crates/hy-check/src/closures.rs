@@ -513,6 +513,11 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
             // must NOT take the class-4 sendability shortcut.
             let immutable = l.kind == LocalKind::Const;
             let is_let = l.kind == LocalKind::Let;
+            if matches!(l.kind, LocalKind::Const) {
+                for (name, value) in l.names.iter().zip(l.values.iter()) {
+                    ck.check_const_init_is_constant(name, value, Some(st));
+                }
+            }
             if l.values.is_empty() {
                 if let Some(t) = &l.ty {
                     ck.check_zero_value_local(l, t);
@@ -532,6 +537,12 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                 let mut overwritten = Vec::new();
                 for (name, value) in l.names.iter().zip(l.values.iter()) {
                     overwritten.push(name.clone());
+                    if let Some(t) = &l.ty {
+                        ck.check_const_overflow_init(name, t, value, Some(&pre_st));
+                    } else if l.kind != LocalKind::Const {
+                        ck.check_default_int_overflow(name, value, Some(&pre_st));
+                        ck.check_default_float_overflow(name, value, Some(&pre_st));
+                    }
                     let moved_non_owned = crate::model::move_operand_ident(value)
                         .and_then(|src| ck.lookup_binding(&pre_st, &src))
                         .and_then(|b| b.non_owned_origin.clone())
@@ -547,11 +558,24 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                         ),
                     };
                     let is_fresh_copy = ck.call_returns_fresh_copy(&pre_st, value);
+                    let shadowed_const = !is_fresh_copy
+                        && ck.shape_may_share(&shape)
+                        && ck.value_reads_storage_of(&pre_st, value, name)
+                        && ck
+                            .const_write_root(
+                                &pre_st,
+                                &hy_syntax::Place {
+                                    kind: hy_syntax::PlaceKind::Ident(name.clone()),
+                                    span: value.span(),
+                                },
+                            )
+                            .is_some();
+                    let is_imm = immutable || shadowed_const;
                     if crate::model::move_operand_ident(value).is_some()
                         || matches!(crate::model::unwrap_parens(value), Expr::Move { .. })
                     {
                         mark_nested_overwritten(st, name, nested);
-                        ck.define_binding(st, name, shape, ty, immutable, managed, is_let);
+                        ck.define_binding(st, name, shape, ty, is_imm, managed, is_let);
                         if let Some(origin) = moved_non_owned {
                             if let Some(b) = st.env_lookup_mut(name) {
                                 b.non_owned_origin = Some(origin);
@@ -618,7 +642,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                     } else {
                         None
                     };
-                    ck.define_binding(st, name, shape, ty, immutable, managed, is_let);
+                    ck.define_binding(st, name, shape, ty, is_imm, managed, is_let);
                     if let Some(origin) = &moved_non_owned {
                         if let Some(b) = st.env_lookup_mut(name) {
                             if b.non_owned_origin.is_none() {

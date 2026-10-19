@@ -5433,9 +5433,29 @@ impl<'a> Checker<'a> {
         for v in values {
             self.mark_move_in_value(st, v, format!("the move-assign `{}`", v.render()));
         }
+        let is_const_write: Vec<bool> = targets
+            .iter()
+            .map(|t| {
+                if self.const_write_root(st, t).is_some() {
+                    return true;
+                }
+                if let PlaceKind::Ident(name) = &t.kind {
+                    if let Some(b) = self.lookup_binding(st, name) {
+                        if b.is_let {
+                            return true;
+                        }
+                    }
+                }
+                false
+            })
+            .collect();
+        for (t, v) in targets.iter().zip(values.iter()) {
+            if let Some(ty) = self.place_declared_ty(st, t) {
+                self.check_const_overflow_assign(&t.render(), &ty, v);
+            }
+        }
         if op == AssignOp::Assign {
-            let no_const_mask = vec![false; targets.len()];
-            self.rebind_assign_targets(st, targets, values, &no_const_mask, 0);
+            self.rebind_assign_targets(st, targets, values, &is_const_write, 0);
         }
         self.record_assign_borrow_aliases(st, targets, op, values);
     }
@@ -8627,6 +8647,65 @@ fn main() {
         assert!(
             check_codes(src_a6).iter().any(|c| c == "HYB-E3103"),
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
+        );
+    }
+
+    #[test]
+    fn closure_local_const_init_and_overflow_and_rebind_guards() {
+        // 1. Non-constant `const` initializer inside closure body -> HYB-E6003
+        let src_non_const = "\
+fn reader(c map[string]int, ch chan int) {
+    ch <- c[\"a\"]
+}
+
+fn main() {
+    ch := make(chan int, 1)
+    f := fn() {
+        var m = map[string]int{\"a\": 1}
+        const c = m
+        task reader(c, move ch)
+        m[\"a\"] = 2
+    }
+    f()
+}
+";
+        assert!(
+            check_codes(src_non_const).iter().any(|c| c == "HYB-E6003"),
+            "expected HYB-E6003 for non-constant `const c = m` inside closure body"
+        );
+
+        // 2. Constant overflow inside closure body -> HYB-E6002
+        let src_overflow = "\
+fn main() {
+    f := fn() {
+        const bad int8 = 300
+        _ = bad
+    }
+    f()
+}
+";
+        assert!(
+            check_codes(src_overflow).iter().any(|c| c == "HYB-E6002"),
+            "expected HYB-E6002 for overflowing `const bad int8 = 300` inside closure body"
+        );
+
+        // 3. Reassignment to `const` inside closure body must not clear `moved` or rebind shape
+        let src_rebind = "\
+fn main() {
+    f := fn() {
+        const c = map[string]int{\"a\": 1}
+        m := map[string]int{\"a\": 2}
+        c = m
+        c[\"a\"] = 3
+    }
+    f()
+}
+";
+        let codes_rebind = check_codes(src_rebind);
+        assert!(
+            codes_rebind.iter().filter(|c| *c == "HYB-E3006").count() >= 2,
+            "expected HYB-E3006 on both `c = m` and `c[\"a\"] = 3` inside closure body, got {:?}",
+            codes_rebind
         );
     }
 }
