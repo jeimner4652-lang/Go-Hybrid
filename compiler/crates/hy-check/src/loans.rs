@@ -5191,6 +5191,35 @@ impl<'a> Checker<'a> {
             }
         }
 
+        let borrow_slot = field_borrow_kind(&shape).is_some() || matches!(shape, TypeShape::Unknown);
+        let carries_borrow = borrow_slot && self.expr_carries_borrow(st, subject);
+        let mut pre_borrowed_roots: Vec<(String, Option<String>)> = Vec::new();
+        if borrow_slot && move_operand_ident(subject).is_none() {
+            let mut addr_roots = Vec::new();
+            self.collect_borrowed_roots(st, subject, &mut addr_roots);
+            for src in addr_roots {
+                let matched = self.lookup_binding(st, &src).map(|b| {
+                    let ok = !b.shape.is_sendable_by_type()
+                        || b.immutable
+                        || self.binding_can_be_borrowed(st, &src);
+                    (ok, b.non_owned_origin.clone())
+                });
+                if let Some((true, origin)) = matched {
+                    pre_borrowed_roots.push((src, origin));
+                }
+            }
+        }
+        let outer_depth = if st
+            .scopes
+            .last()
+            .is_some_and(|top| !top.contains_key(name))
+        {
+            st.lookup_depth(name)
+        } else {
+            None
+        };
+        let prior_shadow_links = st.shadow_links.get(name).cloned().unwrap_or_default();
+
         let self_shadows_const = pre_const_root.as_deref() == Some(name);
         self.define_binding(
             st,
@@ -5202,8 +5231,44 @@ impl<'a> Checker<'a> {
             false,
         );
 
+        if carries_borrow {
+            st.borrow_bindings.insert(name.to_string());
+        } else {
+            st.borrow_bindings.remove(name);
+        }
+
         self.record_may_share(st, name, subject);
         self.record_alias(st, name, subject);
+
+        for (src, origin) in pre_borrowed_roots {
+            if src != name {
+                st.share_edge(name, &src);
+                st.aliases.entry(name.to_string()).or_insert(src);
+            } else {
+                if !prior_shadow_links.is_empty() {
+                    st.shadow_links
+                        .entry(name.to_string())
+                        .or_default()
+                        .extend(prior_shadow_links.clone());
+                }
+                if let Some(depth) = outer_depth {
+                    st.shadow_links
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert((name.to_string(), depth));
+                }
+                st.aliases
+                    .entry(name.to_string())
+                    .or_insert_with(|| name.to_string());
+            }
+            if let Some(origin) = origin {
+                if let Some(nb) = st.env_lookup_mut(name) {
+                    if nb.non_owned_origin.is_none() {
+                        nb.non_owned_origin = Some(origin);
+                    }
+                }
+            }
+        }
 
         for peer in &pre_share_peers {
             if peer != name {
@@ -5230,6 +5295,222 @@ impl<'a> Checker<'a> {
             }
             if b.non_owned_origin.is_none() {
                 b.non_owned_origin = pre_origin;
+            }
+        }
+    }
+
+    /// Bind the loop variables `vars` of `ForKind::Iterate { vars, expr }`
+    /// against a pre-loop snapshot `pre_st` so that defining `vars[0]` (the
+    /// index/key) or self-shadowing `for _, xs in xs` cannot clobber `const`
+    /// immutability (`HYB-E3006`), `may_share` / `aliases` / `shadow_links`
+    /// (`HYB-E3003` / `HYB-E3004`), or stack-borrow provenance (`HYB-E3104`).
+    pub(crate) fn bind_for_iterate_vars(
+        &mut self,
+        st: &mut FnState,
+        vars: &[String],
+        expr: &Expr,
+        managed: bool,
+    ) {
+        let pre_st = st.clone();
+        let is_chan = matches!(self.shape_of_expr(&pre_st, expr), TypeShape::Chan(_));
+        let shapes = self.iterate_var_shapes(&pre_st, expr, vars.len());
+
+        let mut roots = Vec::new();
+        collect_ref_roots(expr, &mut roots);
+        self.collect_callee_const_return_roots(&pre_st, expr, &mut roots, 0);
+
+        let pre_tainted = roots.iter().any(|r| {
+            self.lookup_binding(&pre_st, r)
+                .map(|b| b.managed_taint)
+                .unwrap_or(false)
+        });
+        let pre_const_root = roots.iter().find_map(|r| {
+            let p = Place {
+                kind: PlaceKind::Ident(r.clone()),
+                span: expr.span(),
+            };
+            self.const_write_root(&pre_st, &p)
+        });
+
+        let mut pre_share_peers: Vec<String> = Vec::new();
+        let mut pre_alias_root: Option<String> = None;
+        for r in &roots {
+            if self.binding_may_share(&pre_st, r)
+                || self.expr_slices_addressable_array(&pre_st, expr, r)
+                || !pre_st.share_group(r).is_empty()
+            {
+                pre_share_peers.push(r.clone());
+                pre_share_peers.extend(pre_st.share_group(r));
+            }
+            if pre_alias_root.is_none()
+                && self
+                    .lookup_binding(&pre_st, r)
+                    .map(|b| self.shape_may_share(&b.shape))
+                    .unwrap_or(false)
+            {
+                pre_alias_root = Some(crate::freeze::resolve_alias(&pre_st, r));
+            }
+        }
+
+        let carries_borrow_expr = self.expr_carries_borrow(&pre_st, expr);
+        let mut pre_borrowed_roots: Vec<(String, Option<String>)> = Vec::new();
+        if move_operand_ident(expr).is_none() {
+            let mut addr_roots = Vec::new();
+            self.collect_borrowed_roots(&pre_st, expr, &mut addr_roots);
+            for src in addr_roots {
+                let matched = self.lookup_binding(&pre_st, &src).map(|b| {
+                    let ok = !b.shape.is_sendable_by_type()
+                        || b.immutable
+                        || self.binding_can_be_borrowed(&pre_st, &src);
+                    (ok, b.non_owned_origin.clone())
+                });
+                if let Some((true, origin)) = matched {
+                    pre_borrowed_roots.push((src, origin));
+                }
+            }
+        }
+
+        for (name, shape) in vars.iter().zip(shapes) {
+            if name == "_" {
+                continue;
+            }
+            let is_ref = shape.is_reference_alias() || shape.is_handle();
+            let may_share = self.shape_may_share(&shape);
+            let borrow_slot =
+                field_borrow_kind(&shape).is_some() || matches!(shape, TypeShape::Unknown);
+            let self_shadows_const =
+                !is_chan && may_share && pre_const_root.as_deref() == Some(name.as_str());
+            let reads_self = !is_chan && may_share && self.value_reads_storage_of(&pre_st, expr, name);
+            let outer_exists = pre_st.env.contains_key(name)
+                || pre_st.scopes.iter().any(|s| s.contains_key(name))
+                || self.consts.contains_key(name);
+            let outer_depth = if pre_st
+                .scopes
+                .last()
+                .is_some_and(|top| !top.contains_key(name))
+            {
+                pre_st.lookup_depth(name)
+            } else {
+                None
+            };
+            let prior_shadow_links = if reads_self {
+                pre_st.shadow_links.get(name).cloned().unwrap_or_default()
+            } else {
+                HashSet::new()
+            };
+            let prior_alias = if reads_self {
+                pre_st.aliases.get(name).cloned().or_else(|| {
+                    if outer_exists && !pre_st.scopes.is_empty() {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            let prior_shares: Vec<String> = if reads_self {
+                pre_st
+                    .may_share
+                    .get(name)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            self.define_binding(
+                st,
+                name,
+                shape,
+                None,
+                self_shadows_const,
+                managed || (!is_chan && may_share && pre_tainted),
+                false,
+            );
+
+            if !is_chan && borrow_slot && carries_borrow_expr {
+                st.borrow_bindings.insert(name.clone());
+            } else {
+                st.borrow_bindings.remove(name);
+            }
+
+            if !is_chan {
+                if reads_self {
+                    if !prior_shadow_links.is_empty() {
+                        st.shadow_links
+                            .entry(name.clone())
+                            .or_default()
+                            .extend(prior_shadow_links.clone());
+                    }
+                    if let Some(depth) = outer_depth {
+                        st.shadow_links
+                            .entry(name.clone())
+                            .or_default()
+                            .insert((name.clone(), depth));
+                    }
+                    if let Some(pa) = prior_alias {
+                        st.aliases.insert(name.clone(), pa);
+                    }
+                    for peer in prior_shares {
+                        if peer != *name {
+                            st.share_edge(name, &peer);
+                        }
+                    }
+                }
+                if may_share {
+                    self.record_may_share(st, name, expr);
+                    for peer in &pre_share_peers {
+                        if peer != name {
+                            st.share_edge(name, peer);
+                        }
+                    }
+                    if let Some(croot) = &pre_const_root {
+                        if croot != name {
+                            st.share_edge(name, croot);
+                            st.aliases.entry(name.clone()).or_insert_with(|| croot.clone());
+                        }
+                    }
+                }
+                if borrow_slot {
+                    for (src, _) in &pre_borrowed_roots {
+                        if src != name {
+                            st.share_edge(name, src);
+                            st.aliases.entry(name.clone()).or_insert_with(|| src.clone());
+                        } else {
+                            if let Some(depth) = outer_depth {
+                                st.shadow_links
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .insert((name.clone(), depth));
+                            }
+                            st.aliases
+                                .entry(name.clone())
+                                .or_insert_with(|| name.clone());
+                        }
+                    }
+                }
+                if is_ref {
+                    if let Some(root) = expr.root_ident() {
+                        if self.lookup_binding(&pre_st, root).is_some() {
+                            let target = pre_alias_root
+                                .clone()
+                                .unwrap_or_else(|| root.to_string());
+                            st.aliases.insert(name.clone(), target);
+                        }
+                    } else if let Some(aroot) = &pre_alias_root {
+                        st.aliases.entry(name.clone()).or_insert_with(|| aroot.clone());
+                    }
+                }
+                if let Some(b) = st.env_lookup_mut(name) {
+                    if !self_shadows_const {
+                        b.non_owned_origin = Some(format!(
+                            "range variable `{}` iterating `{}` (the collection still holds the element)",
+                            name,
+                            expr.render()
+                        ));
+                    }
+                }
             }
         }
     }
@@ -6173,29 +6454,7 @@ impl<'a> Checker<'a> {
                 }
                 Stmt::For { kind, .. } => match kind {
                     hy_syntax::ForKind::Iterate { vars, expr } => {
-                        let is_chan =
-                            matches!(self.shape_of_expr(&cst, expr), TypeShape::Chan(_));
-                        let shapes = self.iterate_var_shapes(&cst, expr, vars.len());
-                        for (name, shape) in vars.iter().zip(shapes) {
-                            let is_ref = shape.is_reference_alias() || shape.is_handle();
-                            let carries = self.shape_may_share(&shape);
-                            self.define_binding(&mut cst, name, shape, None, false, false, false);
-                            if !is_chan {
-                                let mut roots = Vec::new();
-                                collect_ref_roots(expr, &mut roots);
-                                self.collect_callee_const_return_roots(&cst, expr, &mut roots, 0);
-                                for root in roots {
-                                    if self.lookup_binding(&cst, &root).is_some() {
-                                        if is_ref {
-                                            cst.aliases.insert(name.clone(), root.clone());
-                                        }
-                                        if carries && self.binding_may_share(&cst, &root) {
-                                            cst.share_edge(name, &root);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        self.bind_for_iterate_vars(&mut cst, vars, expr, false);
                     }
                     hy_syntax::ForKind::Range { var, .. } => {
                         self.define_binding(&mut cst, var, TypeShape::Primitive, None, false, false, false);

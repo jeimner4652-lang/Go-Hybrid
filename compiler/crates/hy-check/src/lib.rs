@@ -697,32 +697,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                         expr,
                         format!("the loop header `{}`", expr.render()),
                     );
-                    let is_chan = matches!(ck.shape_of_expr(&st, expr), TypeShape::Chan(_));
-                    let shapes = ck.iterate_var_shapes(&st, expr, vars.len());
-                    for (name, shape) in vars.iter().zip(shapes) {
-                        let is_ref = shape.is_reference_alias();
-                        let may_share = ck.shape_may_share(&shape);
-                        ck.define_binding(&mut st, name, shape, None, false, managed, false);
-                        if !is_chan {
-                            if may_share {
-                                ck.record_may_share(&mut st, name, expr);
-                            }
-                            if is_ref {
-                                if let Some(root) = expr.root_ident() {
-                                    if ck.lookup_binding(&st, root).is_some() {
-                                        st.aliases.insert(name.clone(), root.to_string());
-                                    }
-                                }
-                            }
-                            if let Some(b) = st.env_lookup_mut(name) {
-                                b.non_owned_origin = Some(format!(
-                                    "range variable `{}` iterating `{}` (the collection still holds the element)",
-                                    name,
-                                    expr.render()
-                                ));
-                            }
-                        }
-                    }
+                    ck.bind_for_iterate_vars(&mut st, vars, expr, managed);
                 }
                 ForKind::Range { var, lo, hi, .. } => {
                     ck.mark_move_in_value(
@@ -5175,6 +5150,85 @@ mod tests {
             .filter(|d| d.code == "HYB-E3006")
             .count();
         assert_eq!(e3006_count, 2, "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn for_iterate_index_and_self_shadow_preserve_const_and_share_provenance() {
+        // 1. Index variable `shared` shadows `const shared` before `v` is bound -> HYB-E3006
+        let r1 = check(
+            "const shared = []map[string]int{map[string]int{\"k\": 1}}\n\
+             fn bad_idx() {\n\
+               for shared, v in shared {\n\
+                 _ = shared\n\
+                 v[\"k\"] = 99\n\
+               }\n\
+             }\n\
+             fn bad_elem() {\n\
+               for _, shared in shared {\n\
+                 shared[\"k\"] = 99\n\
+               }\n\
+             }\n\
+             fn bad_closure() {\n\
+               f := fn() {\n\
+                 for shared, v in shared {\n\
+                   _ = shared\n\
+                   v[\"k\"] = 99\n\
+                 }\n\
+                 for _, shared in shared {\n\
+                   shared[\"k\"] = 99\n\
+                 }\n\
+               }\n\
+               f()\n\
+             }",
+        );
+        assert_eq!(r1.verdict, Verdict::Reject, "{:?}", r1.diagnostics);
+        let e3006_count = r1.diagnostics.iter().filter(|d| d.code == "HYB-E3006").count();
+        assert_eq!(e3006_count, 4, "{:?}", r1.diagnostics);
+
+        // 2. Self-shadowing `for _, xs in xs` or `for m, v in m` preserves sharing across scope_pop -> HYB-E3003 / HYB-E3004
+        let r2 = check(
+            "struct holder { m map[string]int }\n\
+             fn worker(xs []holder) { xs[0].m[\"w\"] = 1 }\n\
+             fn bad_self_shadow() {\n\
+               xs := []holder{holder{m: map[string]int{\"k\": 1}}}\n\
+               var leak map[string]int\n\
+               for _, xs in xs {\n\
+                 leak = xs.m\n\
+               }\n\
+               task worker(move xs)\n\
+               leak[\"k\"] = 99\n\
+             }",
+        );
+        assert_eq!(r2.verdict, Verdict::Reject, "{:?}", r2.diagnostics);
+        assert!(
+            r2.diagnostics.iter().any(|d| d.code == "HYB-E3003"),
+            "{:?}",
+            r2.diagnostics
+        );
+    }
+
+    #[test]
+    fn for_iterate_and_match_bind_propagate_stack_borrow_taint_e3104() {
+        let r = check(
+            "struct node { val int }\n\
+             fn escape_for() *node {\n\
+               n := node{val: 1}\n\
+               for _, p in []*node{&n} {\n\
+                 return p\n\
+               }\n\
+               return nil\n\
+             }\n\
+             fn escape_match() *node {\n\
+               n := node{val: 1}\n\
+               match some(&n) {\n\
+                 some(p): { return p }\n\
+                 none: { return nil }\n\
+               }\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        let e3104_count = r.diagnostics.iter().filter(|d| d.code == "HYB-E3104").count();
+        assert_eq!(e3104_count, 2, "{:?}", r.diagnostics);
     }
 }
 

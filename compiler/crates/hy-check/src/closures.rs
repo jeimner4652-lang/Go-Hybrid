@@ -985,33 +985,10 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                     );
                     sync_nested_moves(st, nested);
                     collect_expr_direct_fnlits(expr, st, nested);
-                    let is_chan = matches!(ck.shape_of_expr(st, expr), TypeShape::Chan(_));
-                    let shapes = ck.iterate_var_shapes(st, expr, vars.len());
-                    for (name, shape) in vars.iter().zip(shapes) {
-                        let is_ref = shape.is_reference_alias();
-                        let may_share = ck.shape_may_share(&shape);
+                    for name in vars {
                         mark_nested_overwritten(st, name, nested);
-                        ck.define_binding(st, name, shape, None, false, managed, false);
-                        if !is_chan {
-                            if may_share {
-                                ck.record_may_share(st, name, expr);
-                            }
-                            if is_ref {
-                                if let Some(root) = expr.root_ident() {
-                                    if ck.lookup_binding(st, root).is_some() {
-                                        st.aliases.insert(name.clone(), root.to_string());
-                                    }
-                                }
-                            }
-                            if let Some(b) = st.env_lookup_mut(name) {
-                                b.non_owned_origin = Some(format!(
-                                    "range variable `{}` iterating `{}` (the collection still holds the element)",
-                                    name,
-                                    expr.render()
-                                ));
-                            }
-                        }
                     }
+                    ck.bind_for_iterate_vars(st, vars, expr, managed);
                     sync_nested_moves(st, nested);
                 }
                 Range { var, lo, hi, .. } => {
