@@ -997,12 +997,12 @@ impl<'a> Checker<'a> {
                     }
                 }
                 Stmt::For {
-                    kind: ForKind::Iterate { vars, iter, .. },
+                    kind: hy_syntax::ForKind::Iterate { vars, expr },
                     ..
                 } => {
                     let mut roots = Vec::new();
-                    collect_ref_roots(iter, &mut roots);
-                    collect_addr_of_roots(iter, &mut roots);
+                    collect_ref_roots(expr, &mut roots);
+                    collect_addr_of_roots(expr, &mut roots);
                     let reaches = roots.iter().any(|r| pre_aliases.contains(r));
                     for v in vars {
                         if v == "_" {
@@ -4857,7 +4857,11 @@ impl<'a> Checker<'a> {
                             }
                         }
                         walk::ScopeEvent::MatchBind { name, subject } => {
-                            let (shape, ty) = self.match_bind_shape_and_ty(&cst, subject);
+                            let shape = self.shape_of_expr(&cst, subject);
+                            let ty = match self.ty_of_expr(&cst, subject) {
+                                Some(hy_syntax::TypeExpr::Option { elem, .. }) => Some(*elem),
+                                other => other,
+                            };
                             let mut s = HashSet::new();
                             {
                                 let (cur_o, cur_s, _) = scope_stack.last().unwrap();
