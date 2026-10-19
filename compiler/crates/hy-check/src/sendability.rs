@@ -633,11 +633,11 @@ impl<'a> Checker<'a> {
         }
     }
 
-    pub(crate) fn resolve_spawn_method_decl(
+    pub(crate) fn resolve_spawn_method_decl<'b>(
         &self,
         st: &FnState,
-        callee: &Expr,
-    ) -> Option<(&'a hy_syntax::FnDecl, &'a Expr)> {
+        callee: &'b Expr,
+    ) -> Option<(&'a hy_syntax::FnDecl, &'b Expr)> {
         let Expr::Field {
             base,
             name: method_name,
