@@ -513,11 +513,6 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
             // must NOT take the class-4 sendability shortcut.
             let immutable = l.kind == LocalKind::Const;
             let is_let = l.kind == LocalKind::Let;
-            if matches!(l.kind, LocalKind::Const) {
-                for (name, value) in l.names.iter().zip(l.values.iter()) {
-                    ck.check_const_init_is_constant(name, value, Some(st));
-                }
-            }
             if l.values.is_empty() {
                 if let Some(t) = &l.ty {
                     ck.check_zero_value_local(l, t);
@@ -537,12 +532,6 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                 let mut overwritten = Vec::new();
                 for (name, value) in l.names.iter().zip(l.values.iter()) {
                     overwritten.push(name.clone());
-                    if let Some(t) = &l.ty {
-                        ck.check_const_overflow_init(name, t, value, Some(&pre_st));
-                    } else if l.kind != LocalKind::Const {
-                        ck.check_default_int_overflow(name, value, Some(&pre_st));
-                        ck.check_default_float_overflow(name, value, Some(&pre_st));
-                    }
                     let moved_non_owned = crate::model::move_operand_ident(value)
                         .and_then(|src| ck.lookup_binding(&pre_st, &src))
                         .and_then(|b| b.non_owned_origin.clone())

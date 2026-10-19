@@ -5449,11 +5449,6 @@ impl<'a> Checker<'a> {
                 false
             })
             .collect();
-        for (t, v) in targets.iter().zip(values.iter()) {
-            if let Some(ty) = self.place_declared_ty(st, t) {
-                self.check_const_overflow_assign(&t.render(), &ty, v);
-            }
-        }
         if op == AssignOp::Assign {
             self.rebind_assign_targets(st, targets, values, &is_const_write, 0);
         }
