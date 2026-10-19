@@ -1,10 +1,9 @@
-use hy_check::{check, CheckOptions};
+use hy_check::check_file;
 use hy_syntax::parse_file;
-use std::path::PathBuf;
 
 fn check_src(src: &str) -> Vec<String> {
-    let file = parse_file(src, PathBuf::from("test.hy")).expect("parse");
-    let res = check(&file, CheckOptions::default());
+    let file = parse_file("test.hy", src).expect("parse");
+    let res = check_file(&file);
     res.diagnostics.into_iter().map(|d| d.code).collect()
 }
 
