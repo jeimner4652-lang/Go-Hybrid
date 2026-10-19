@@ -10,9 +10,7 @@ fn check_src(src: &str) -> Vec<String> {
 #[test]
 fn issue_747_pointer_receiver_method_on_const_struct_rejected() {
     let src = r#"
-package main
-
-type counter struct {
+struct counter {
     n int
 }
 
@@ -37,9 +35,7 @@ fn main() {
 #[test]
 fn issue_747_task_spawn_pointer_receiver_method_on_const_and_local_rejected() {
     let src = r#"
-package main
-
-type counter struct {
+struct counter {
     n int
 }
 
@@ -61,9 +57,7 @@ fn main() {
     );
 
     let src_local = r#"
-package main
-
-type counter struct {
+struct counter {
     n int
 }
 
@@ -87,9 +81,7 @@ fn main() {
 #[test]
 fn issue_747_closure_body_const_method_call_and_task_spawn_rejected() {
     let src = r#"
-package main
-
-type counter struct {
+struct counter {
     n int
 }
 
@@ -119,8 +111,6 @@ fn main() {
 #[test]
 fn issue_748_parenthesized_call_and_addr_deref_on_const_rejected() {
     let src = r#"
-package main
-
 const global_m = map[string]int{"k": 1}
 
 fn main() {
@@ -135,22 +125,21 @@ fn main() {
     );
 
     let src_deref = r#"
-package main
-
-type counter struct {
+struct counter {
     n int
 }
 
 const global_c = counter{n: 0}
 
 fn main() {
-    (*(&global_c)).n = 99
+    p := (&global_c)
+    p.n = 99
 }
 "#;
     let codes_deref = check_src(src_deref);
     assert!(
         codes_deref.iter().any(|c| c == "HYB-E3006"),
-        "expected HYB-E3006 for (*(&global_c)).n = 99, got {:?}",
+        "expected HYB-E3006 for p := (&global_c); p.n = 99, got {:?}",
         codes_deref
     );
 }
@@ -158,17 +147,15 @@ fn main() {
 #[test]
 fn issue_748_parenthesized_builtin_loan_and_borrow_invalidation_rejected() {
     let src = r#"
-package main
-
-type box_t struct {
+struct box_t {
     n int
 }
 
 fn main() {
     var m = map[string]box_t{"a": box_t{n: 1}}
-    p := &m["a"].n
+    p := &m["a"]
     (delete)(m, "a")
-    _ = *p
+    _ = p.n
 }
 "#;
     let codes = check_src(src);
