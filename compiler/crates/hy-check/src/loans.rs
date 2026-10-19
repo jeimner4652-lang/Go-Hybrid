@@ -836,13 +836,34 @@ impl<'a> Checker<'a> {
                             }
                         }
                         walk::ScopeEvent::MatchBind { name, subject } => {
+                            locals_stack.last_mut().unwrap().insert(name.to_string());
                             let mut sroots = Vec::new();
                             collect_ref_roots(subject, &mut sroots);
+                            collect_addr_of_roots(subject, &mut sroots);
                             if sroots.iter().any(|r| alias_stack.last().unwrap().contains(r)) {
                                 alias_stack.last_mut().unwrap().insert(name.to_string());
+                            } else {
+                                alias_stack.last_mut().unwrap().remove(*name);
                             }
                         }
-                        _ => {}
+                        walk::ScopeEvent::SelectRecv { names, chan } => {
+                            let mut croots = Vec::new();
+                            collect_ref_roots(chan, &mut croots);
+                            let reaches = croots
+                                .iter()
+                                .any(|r| alias_stack.last().unwrap().contains(r));
+                            for n in *names {
+                                if n == "_" {
+                                    continue;
+                                }
+                                locals_stack.last_mut().unwrap().insert(n.clone());
+                                if reaches {
+                                    alias_stack.last_mut().unwrap().insert(n.clone());
+                                } else {
+                                    alias_stack.last_mut().unwrap().remove(n);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -885,6 +906,19 @@ impl<'a> Checker<'a> {
             let mut calls = Vec::new();
             walk::own_calls(stmt, &mut calls);
             for cr in &calls {
+                if let Expr::Ident { name, .. } = unwrap_parens(cr.callee) {
+                    if name == "copy" && cr.args.len() >= 2 {
+                        let mut src_roots = Vec::new();
+                        collect_ref_roots(&cr.args[1].value, &mut src_roots);
+                        if src_roots.iter().any(|r| alias_stack.last().unwrap().contains(r)) {
+                            let mut dst_roots = Vec::new();
+                            collect_ref_roots(&cr.args[0].value, &mut dst_roots);
+                            for dr in dst_roots {
+                                alias_stack.last_mut().unwrap().insert(dr);
+                            }
+                        }
+                    }
+                }
                 if alias_stack.last().unwrap().iter().any(|p| self.call_mutates_param(cr, p, depth)) {
                     return true;
                 }
@@ -894,27 +928,91 @@ impl<'a> Checker<'a> {
             let pre_aliases = alias_stack.last().unwrap().clone();
             match stmt {
                 Stmt::Local(l) => {
-                    for (name, val) in l.names.iter().zip(if l.values.len() == 1 { vec![&l.values[0]; l.names.len()] } else { l.values.iter().collect() }) {
-                        locals_stack.last_mut().unwrap().insert(name.clone());
-                        let mut roots = Vec::new();
-                        collect_ref_roots(val, &mut roots);
-                        if roots.iter().any(|r| pre_aliases.contains(r)) {
-                            alias_stack.last_mut().unwrap().insert(name.clone());
-                        } else {
+                    if l.values.is_empty() {
+                        for name in &l.names {
+                            locals_stack.last_mut().unwrap().insert(name.clone());
                             alias_stack.last_mut().unwrap().remove(name);
                         }
-                    }
-                }
-                Stmt::Assign { targets, values, .. } if targets.len() == values.len() => {
-                    for (t, val) in targets.iter().zip(values.iter()) {
-                        if let PlaceKind::Ident(name) = &t.kind {
+                    } else {
+                        for (name, val) in l.names.iter().zip(if l.values.len() == 1 { vec![&l.values[0]; l.names.len()] } else { l.values.iter().collect() }) {
+                            locals_stack.last_mut().unwrap().insert(name.clone());
                             let mut roots = Vec::new();
                             collect_ref_roots(val, &mut roots);
+                            collect_addr_of_roots(val, &mut roots);
                             if roots.iter().any(|r| pre_aliases.contains(r)) {
                                 alias_stack.last_mut().unwrap().insert(name.clone());
                             } else {
                                 alias_stack.last_mut().unwrap().remove(name);
                             }
+                        }
+                    }
+                }
+                Stmt::Assign { targets, values, .. } => {
+                    if targets.len() == values.len() {
+                        for (t, val) in targets.iter().zip(values.iter()) {
+                            let mut roots = Vec::new();
+                            collect_ref_roots(val, &mut roots);
+                            collect_addr_of_roots(val, &mut roots);
+                            let reaches = roots.iter().any(|r| pre_aliases.contains(r));
+                            match &t.kind {
+                                PlaceKind::Ident(name) => {
+                                    if reaches {
+                                        alias_stack.last_mut().unwrap().insert(name.clone());
+                                    } else {
+                                        alias_stack.last_mut().unwrap().remove(name);
+                                    }
+                                }
+                                PlaceKind::Field { .. } | PlaceKind::Index { .. } => {
+                                    let root = t.root();
+                                    if !root.is_empty() && reaches {
+                                        alias_stack.last_mut().unwrap().insert(root.to_string());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else if values.len() == 1 && targets.len() > 1 {
+                        let mut roots = Vec::new();
+                        collect_ref_roots(&values[0], &mut roots);
+                        collect_addr_of_roots(&values[0], &mut roots);
+                        let reaches = roots.iter().any(|r| pre_aliases.contains(r));
+                        for t in targets {
+                            match &t.kind {
+                                PlaceKind::Ident(name) => {
+                                    if reaches {
+                                        alias_stack.last_mut().unwrap().insert(name.clone());
+                                    } else {
+                                        alias_stack.last_mut().unwrap().remove(name);
+                                    }
+                                }
+                                PlaceKind::Field { .. } | PlaceKind::Index { .. } => {
+                                    let root = t.root();
+                                    if !root.is_empty() && reaches {
+                                        alias_stack.last_mut().unwrap().insert(root.to_string());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Stmt::For {
+                    kind: ForKind::Iterate { vars, iter, .. },
+                    ..
+                } => {
+                    let mut roots = Vec::new();
+                    collect_ref_roots(iter, &mut roots);
+                    collect_addr_of_roots(iter, &mut roots);
+                    let reaches = roots.iter().any(|r| pre_aliases.contains(r));
+                    for v in vars {
+                        if v == "_" {
+                            continue;
+                        }
+                        locals_stack.last_mut().unwrap().insert(v.clone());
+                        if reaches {
+                            alias_stack.last_mut().unwrap().insert(v.clone());
+                        } else {
+                            alias_stack.last_mut().unwrap().remove(v);
                         }
                     }
                 }
@@ -4347,6 +4445,7 @@ impl<'a> Checker<'a> {
                      -> HashSet<String> {
                         let mut roots = Vec::new();
                         collect_ref_roots(e, &mut roots);
+                        collect_addr_of_roots(e, &mut roots);
                         self.collect_callee_const_return_roots(st, e, &mut roots, depth + 1);
                         let mut set = HashSet::new();
                         for r in roots {
@@ -4363,17 +4462,103 @@ impl<'a> Checker<'a> {
                         set
                     };
                 let flat = walk::flatten(body);
-                for (stmt, _) in &flat.stmts {
+                let mut scope_stack: Vec<(
+                    HashMap<String, HashSet<String>>,
+                    HashSet<String>,
+                    HashSet<String>,
+                )> = vec![(aliases, shadowed, HashSet::new())];
+                for (stmt, idx) in &flat.stmts {
+                    if let Some(evs) = flat.events.get(idx) {
+                        for ev in evs {
+                            match ev {
+                                walk::ScopeEvent::Push => {
+                                    let (cur_a, cur_s, _) = scope_stack.last().unwrap().clone();
+                                    scope_stack.push((cur_a, cur_s, HashSet::new()));
+                                }
+                                walk::ScopeEvent::Pop => {
+                                    if scope_stack.len() > 1 {
+                                        let (popped_a, _, popped_locals) =
+                                            scope_stack.pop().unwrap();
+                                        let (parent_a, parent_s, _) =
+                                            scope_stack.last_mut().unwrap();
+                                        for (k, cs) in popped_a {
+                                            if !popped_locals.contains(&k) && !cs.is_empty() {
+                                                parent_s.remove(&k);
+                                                parent_a.entry(k).or_default().extend(cs);
+                                            }
+                                        }
+                                    }
+                                }
+                                walk::ScopeEvent::MatchBind { name, subject } => {
+                                    let (cur_a, cur_s, _) = scope_stack.last().unwrap();
+                                    let cs = expr_const_origins(subject, cur_a, cur_s);
+                                    let (aliases, shadowed, locals) =
+                                        scope_stack.last_mut().unwrap();
+                                    locals.insert((*name).to_string());
+                                    if cs.is_empty() {
+                                        aliases.remove(*name);
+                                        shadowed.insert((*name).to_string());
+                                    } else {
+                                        shadowed.remove(*name);
+                                        aliases.insert((*name).to_string(), cs);
+                                    }
+                                }
+                                walk::ScopeEvent::SelectRecv { names, chan } => {
+                                    let (cur_a, cur_s, _) = scope_stack.last().unwrap();
+                                    let cs = expr_const_origins(chan, cur_a, cur_s);
+                                    let (aliases, shadowed, locals) =
+                                        scope_stack.last_mut().unwrap();
+                                    for n in *names {
+                                        if n == "_" {
+                                            continue;
+                                        }
+                                        locals.insert(n.clone());
+                                        if cs.is_empty() {
+                                            aliases.remove(n);
+                                            shadowed.insert(n.clone());
+                                        } else {
+                                            shadowed.remove(n);
+                                            aliases.insert(n.clone(), cs.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut calls = Vec::new();
+                    walk::own_calls(stmt, &mut calls);
+                    for cr in &calls {
+                        if let Expr::Ident { name, .. } = unwrap_parens(cr.callee) {
+                            if name == "copy" && cr.args.len() >= 2 {
+                                let (cur_a, cur_s, _) = scope_stack.last().unwrap();
+                                let cs = expr_const_origins(&cr.args[1].value, cur_a, cur_s);
+                                if !cs.is_empty() {
+                                    let mut dst_roots = Vec::new();
+                                    collect_ref_roots(&cr.args[0].value, &mut dst_roots);
+                                    let (aliases, shadowed, _) = scope_stack.last_mut().unwrap();
+                                    for dr in dst_roots {
+                                        shadowed.remove(&dr);
+                                        aliases.entry(dr).or_default().extend(cs.iter().cloned());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     match stmt {
                         Stmt::Local(l) => {
                             if l.values.is_empty() {
+                                let (aliases, shadowed, locals) = scope_stack.last_mut().unwrap();
                                 for n in &l.names {
+                                    locals.insert(n.clone());
                                     aliases.remove(n);
                                     shadowed.insert(n.clone());
                                 }
                             } else if l.values.len() == 1 && l.names.len() > 1 {
-                                let cs = expr_const_origins(&l.values[0], &aliases, &shadowed);
+                                let (cur_a, cur_s, _) = scope_stack.last().unwrap();
+                                let cs = expr_const_origins(&l.values[0], cur_a, cur_s);
+                                let (aliases, shadowed, locals) = scope_stack.last_mut().unwrap();
                                 for n in &l.names {
+                                    locals.insert(n.clone());
                                     if cs.is_empty() {
                                         aliases.remove(n);
                                         shadowed.insert(n.clone());
@@ -4383,8 +4568,15 @@ impl<'a> Checker<'a> {
                                     }
                                 }
                             } else {
-                                for (n, v) in l.names.iter().zip(l.values.iter()) {
-                                    let cs = expr_const_origins(v, &aliases, &shadowed);
+                                let (cur_a, cur_s, _) = scope_stack.last().unwrap();
+                                let rhs_cs: Vec<HashSet<String>> = l
+                                    .values
+                                    .iter()
+                                    .map(|v| expr_const_origins(v, cur_a, cur_s))
+                                    .collect();
+                                let (aliases, shadowed, locals) = scope_stack.last_mut().unwrap();
+                                for (n, cs) in l.names.iter().zip(rhs_cs) {
+                                    locals.insert(n.clone());
                                     if cs.is_empty() {
                                         aliases.remove(n);
                                         shadowed.insert(n.clone());
@@ -4399,10 +4591,12 @@ impl<'a> Checker<'a> {
                             targets, values, ..
                         } => {
                             if targets.len() == values.len() {
+                                let (cur_a, cur_s, _) = scope_stack.last().unwrap();
                                 let rhs_cs: Vec<HashSet<String>> = values
                                     .iter()
-                                    .map(|v| expr_const_origins(v, &aliases, &shadowed))
+                                    .map(|v| expr_const_origins(v, cur_a, cur_s))
                                     .collect();
+                                let (aliases, shadowed, _) = scope_stack.last_mut().unwrap();
                                 for (t, cs) in targets.iter().zip(rhs_cs) {
                                     match &t.kind {
                                         PlaceKind::Ident(n) => {
@@ -4417,6 +4611,7 @@ impl<'a> Checker<'a> {
                                         PlaceKind::Field { .. } | PlaceKind::Index { .. } => {
                                             let root = t.root();
                                             if !root.is_empty() && !cs.is_empty() {
+                                                shadowed.remove(root);
                                                 aliases
                                                     .entry(root.to_string())
                                                     .or_default()
@@ -4427,21 +4622,58 @@ impl<'a> Checker<'a> {
                                     }
                                 }
                             } else if values.len() == 1 && targets.len() > 1 {
-                                let cs = expr_const_origins(&values[0], &aliases, &shadowed);
+                                let (cur_a, cur_s, _) = scope_stack.last().unwrap();
+                                let cs = expr_const_origins(&values[0], cur_a, cur_s);
+                                let (aliases, shadowed, _) = scope_stack.last_mut().unwrap();
                                 for t in targets {
-                                    if let PlaceKind::Ident(n) = &t.kind {
-                                        if cs.is_empty() {
-                                            aliases.remove(n);
-                                            shadowed.insert(n.clone());
-                                        } else {
-                                            shadowed.remove(n);
-                                            aliases.insert(n.clone(), cs.clone());
+                                    match &t.kind {
+                                        PlaceKind::Ident(n) => {
+                                            if cs.is_empty() {
+                                                aliases.remove(n);
+                                                shadowed.insert(n.clone());
+                                            } else {
+                                                shadowed.remove(n);
+                                                aliases.insert(n.clone(), cs.clone());
+                                            }
                                         }
+                                        PlaceKind::Field { .. } | PlaceKind::Index { .. } => {
+                                            let root = t.root();
+                                            if !root.is_empty() && !cs.is_empty() {
+                                                shadowed.remove(root);
+                                                aliases
+                                                    .entry(root.to_string())
+                                                    .or_default()
+                                                    .extend(cs.iter().cloned());
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
                         }
+                        Stmt::For {
+                            kind: ForKind::Iterate { vars, iter, .. },
+                            ..
+                        } => {
+                            let (cur_a, cur_s, _) = scope_stack.last().unwrap();
+                            let cs = expr_const_origins(iter, cur_a, cur_s);
+                            let (aliases, shadowed, locals) = scope_stack.last_mut().unwrap();
+                            for v in vars {
+                                if v == "_" {
+                                    continue;
+                                }
+                                locals.insert(v.clone());
+                                if cs.is_empty() {
+                                    aliases.remove(v);
+                                    shadowed.insert(v.clone());
+                                } else {
+                                    shadowed.remove(v);
+                                    aliases.insert(v.clone(), cs.clone());
+                                }
+                            }
+                        }
                         Stmt::Return { values, .. } => {
+                            let (aliases, shadowed, _) = scope_stack.last().unwrap();
                             if values.is_empty() {
                                 for (nr, _) in &typed_results {
                                     if let Some(cs) = aliases.get(nr) {
@@ -4454,7 +4686,7 @@ impl<'a> Checker<'a> {
                                 }
                             } else {
                                 for v in values {
-                                    for c in expr_const_origins(v, &aliases, &shadowed) {
+                                    for c in expr_const_origins(v, aliases, shadowed) {
                                         if !out.contains(&c) {
                                             out.push(c);
                                         }
@@ -4597,24 +4829,121 @@ impl<'a> Checker<'a> {
 
         let flat = walk::flatten(body);
         let mut pairs: Vec<(usize, usize)> = Vec::new();
+        let mut scope_stack: Vec<(
+            HashMap<String, HashSet<String>>,
+            HashSet<String>,
+            HashSet<String>,
+        )> = vec![(origins, shadowed, HashSet::new())];
         for (stmt, idx) in flat.stmts.iter().copied() {
+            if let Some(evs) = flat.events.get(&idx) {
+                for ev in evs {
+                    match ev {
+                        walk::ScopeEvent::Push => {
+                            cst.scope_push();
+                            let (cur_o, cur_s, _) = scope_stack.last().unwrap().clone();
+                            scope_stack.push((cur_o, cur_s, HashSet::new()));
+                        }
+                        walk::ScopeEvent::Pop => {
+                            cst.scope_pop();
+                            if scope_stack.len() > 1 {
+                                let (popped_o, _, popped_locals) = scope_stack.pop().unwrap();
+                                let (parent_o, parent_s, _) = scope_stack.last_mut().unwrap();
+                                for (k, os) in popped_o {
+                                    if !popped_locals.contains(&k) && !os.is_empty() {
+                                        parent_s.remove(&k);
+                                        parent_o.entry(k).or_default().extend(os);
+                                    }
+                                }
+                            }
+                        }
+                        walk::ScopeEvent::MatchBind { name, subject } => {
+                            let (shape, ty) = match self.shape_of_expr(&cst, subject) {
+                                TypeShape::Option(inner) => (*inner, None),
+                                other => (other, None),
+                            };
+                            let mut s = HashSet::new();
+                            {
+                                let (cur_o, cur_s, _) = scope_stack.last().unwrap();
+                                self.collect_sharing_origins_expr(&cst, subject, cur_o, cur_s, &mut s);
+                            }
+                            self.define_binding(&mut cst, name, shape.clone(), ty, false, false, true);
+                            let (origins, shadowed, locals) = scope_stack.last_mut().unwrap();
+                            locals.insert((*name).to_string());
+                            if self.shape_may_share(&shape)
+                                || matches!(shape, TypeShape::Unknown | TypeShape::Array(_))
+                            {
+                                if s.is_empty() {
+                                    s.insert(format!("local:{idx}:{name}"));
+                                }
+                                origins.insert((*name).to_string(), s);
+                                shadowed.remove(*name);
+                            } else {
+                                origins.remove(*name);
+                                shadowed.insert((*name).to_string());
+                            }
+                        }
+                        walk::ScopeEvent::SelectRecv { names, chan } => {
+                            let elem_shape = match self.shape_of_expr(&cst, chan) {
+                                TypeShape::Chan(inner) => *inner,
+                                _ => TypeShape::Unknown,
+                            };
+                            let mut base_o = HashSet::new();
+                            {
+                                let (cur_o, cur_s, _) = scope_stack.last().unwrap();
+                                self.collect_sharing_origins_expr(&cst, chan, cur_o, cur_s, &mut base_o);
+                            }
+                            let (origins, shadowed, locals) = scope_stack.last_mut().unwrap();
+                            for (i, n) in names.iter().enumerate() {
+                                if n == "_" {
+                                    continue;
+                                }
+                                let sh = if i == 0 {
+                                    elem_shape.clone()
+                                } else {
+                                    TypeShape::Scalar
+                                };
+                                self.define_binding(&mut cst, n, sh.clone(), None, false, false, false);
+                                locals.insert(n.clone());
+                                if self.shape_may_share(&sh)
+                                    || matches!(sh, TypeShape::Unknown | TypeShape::Array(_))
+                                {
+                                    let mut s = base_o.clone();
+                                    if s.is_empty() {
+                                        s.insert(format!("local:{idx}:{n}"));
+                                    }
+                                    origins.insert(n.clone(), s);
+                                    shadowed.remove(n);
+                                } else {
+                                    origins.remove(n);
+                                    shadowed.insert(n.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let mut calls = Vec::new();
             walk::own_calls(stmt, &mut calls);
             for cr in &calls {
                 if let Expr::Ident { name, .. } = unwrap_parens(cr.callee) {
                     if name == "copy" && cr.args.len() >= 2 {
                         let mut src_o = HashSet::new();
-                        self.collect_sharing_origins_expr(
-                            &cst,
-                            &cr.args[1].value,
-                            &origins,
-                            &shadowed,
-                            &mut src_o,
-                        );
+                        {
+                            let (origins, shadowed, _) = scope_stack.last().unwrap();
+                            self.collect_sharing_origins_expr(
+                                &cst,
+                                &cr.args[1].value,
+                                origins,
+                                shadowed,
+                                &mut src_o,
+                            );
+                        }
                         let mut dst_roots = Vec::new();
                         collect_ref_roots(&cr.args[0].value, &mut dst_roots);
+                        let (origins, shadowed, _) = scope_stack.last_mut().unwrap();
                         for dr in dst_roots {
                             if !src_o.is_empty() {
+                                shadowed.remove(&dr);
                                 origins.entry(dr).or_default().extend(src_o.iter().cloned());
                             }
                         }
@@ -4633,15 +4962,18 @@ impl<'a> Checker<'a> {
                                 (slots.get(dst_idx), slots.get(src_idx))
                             {
                                 let mut src_o = HashSet::new();
-                                match src_src {
-                                    CalleeSlotSource::Arg(src_e) => {
-                                        self.collect_sharing_origins_expr(
-                                            &cst, src_e, &origins, &shadowed, &mut src_o,
-                                        );
-                                    }
-                                    CalleeSlotSource::OuterBinding(bname) => {
-                                        if let Some(os) = origins.get(bname) {
-                                            src_o.extend(os.iter().cloned());
+                                {
+                                    let (origins, shadowed, _) = scope_stack.last().unwrap();
+                                    match src_src {
+                                        CalleeSlotSource::Arg(src_e) => {
+                                            self.collect_sharing_origins_expr(
+                                                &cst, src_e, origins, shadowed, &mut src_o,
+                                            );
+                                        }
+                                        CalleeSlotSource::OuterBinding(bname) => {
+                                            if let Some(os) = origins.get(bname) {
+                                                src_o.extend(os.iter().cloned());
+                                            }
                                         }
                                     }
                                 }
@@ -4655,8 +4987,10 @@ impl<'a> Checker<'a> {
                                         dst_roots.push(bname.clone());
                                     }
                                 }
+                                let (origins, shadowed, _) = scope_stack.last_mut().unwrap();
                                 for dr in dst_roots {
                                     if !src_o.is_empty() {
+                                        shadowed.remove(&dr);
                                         origins
                                             .entry(dr)
                                             .or_default()
@@ -4677,6 +5011,7 @@ impl<'a> Checker<'a> {
                             .as_ref()
                             .map(|t| self.shape_of_type(t))
                             .unwrap_or(TypeShape::Unknown);
+                        let (origins, shadowed, locals) = scope_stack.last_mut().unwrap();
                         for name in &l.names {
                             self.define_binding(
                                 &mut cst,
@@ -4687,6 +5022,7 @@ impl<'a> Checker<'a> {
                                 false,
                                 is_let,
                             );
+                            locals.insert(name.clone());
                             if self.shape_may_share(&shape)
                                 || matches!(shape, TypeShape::Unknown | TypeShape::Array(_))
                             {
@@ -4704,15 +5040,20 @@ impl<'a> Checker<'a> {
                         let shapes = self.multi_value_shapes(&cst, &l.values[0], l.names.len());
                         let tys = self.multi_value_tys(&cst, &l.values[0], l.names.len());
                         let mut base_o = HashSet::new();
-                        self.collect_sharing_origins_expr(
-                            &cst,
-                            &l.values[0],
-                            &origins,
-                            &shadowed,
-                            &mut base_o,
-                        );
+                        {
+                            let (origins, shadowed, _) = scope_stack.last().unwrap();
+                            self.collect_sharing_origins_expr(
+                                &cst,
+                                &l.values[0],
+                                origins,
+                                shadowed,
+                                &mut base_o,
+                            );
+                        }
+                        let (origins, shadowed, locals) = scope_stack.last_mut().unwrap();
                         for ((name, shape), ty) in l.names.iter().zip(shapes).zip(tys) {
                             self.define_binding(&mut cst, name, shape.clone(), ty, false, false, is_let);
+                            locals.insert(name.clone());
                             if self.shape_may_share(&shape)
                                 || matches!(shape, TypeShape::Unknown | TypeShape::Array(_))
                             {
@@ -4732,26 +5073,30 @@ impl<'a> Checker<'a> {
                             TypeShape,
                             Option<hy_syntax::TypeExpr>,
                             HashSet<String>,
-                        )> = l
-                            .values
-                            .iter()
-                            .map(|v| {
-                                let inf = self.shape_of_expr(&cst, v);
-                                let (sh, ty) = match (&l.ty, inf) {
-                                    (Some(t), TypeShape::Unknown) => {
-                                        (self.shape_of_type(t), Some(t.clone()))
-                                    }
-                                    (_, s) => (s, self.ty_of_expr(&cst, v).or_else(|| l.ty.clone())),
-                                };
-                                let mut os = HashSet::new();
-                                self.collect_sharing_origins_expr(
-                                    &cst, v, &origins, &shadowed, &mut os,
-                                );
-                                (sh, ty, os)
-                            })
-                            .collect();
+                        )> = {
+                            let (origins, shadowed, _) = scope_stack.last().unwrap();
+                            l.values
+                                .iter()
+                                .map(|v| {
+                                    let inf = self.shape_of_expr(&cst, v);
+                                    let (sh, ty) = match (&l.ty, inf) {
+                                        (Some(t), TypeShape::Unknown) => {
+                                            (self.shape_of_type(t), Some(t.clone()))
+                                        }
+                                        (_, s) => (s, self.ty_of_expr(&cst, v).or_else(|| l.ty.clone())),
+                                    };
+                                    let mut os = HashSet::new();
+                                    self.collect_sharing_origins_expr(
+                                        &cst, v, origins, shadowed, &mut os,
+                                    );
+                                    (sh, ty, os)
+                                })
+                                .collect()
+                        };
+                        let (origins, shadowed, locals) = scope_stack.last_mut().unwrap();
                         for (name, (shape, ty, mut s)) in l.names.iter().zip(rhs_info) {
                             self.define_binding(&mut cst, name, shape.clone(), ty, false, false, is_let);
+                            locals.insert(name.clone());
                             if self.shape_may_share(&shape)
                                 || matches!(shape, TypeShape::Unknown | TypeShape::Array(_))
                             {
@@ -4775,18 +5120,22 @@ impl<'a> Checker<'a> {
                             TypeShape,
                             Option<hy_syntax::TypeExpr>,
                             HashSet<String>,
-                        )> = values
-                            .iter()
-                            .map(|v| {
-                                let sh = self.shape_of_expr(&cst, v);
-                                let ty = self.ty_of_expr(&cst, v);
-                                let mut os = HashSet::new();
-                                self.collect_sharing_origins_expr(
-                                    &cst, v, &origins, &shadowed, &mut os,
-                                );
-                                (sh, ty, os)
-                            })
-                            .collect();
+                        )> = {
+                            let (origins, shadowed, _) = scope_stack.last().unwrap();
+                            values
+                                .iter()
+                                .map(|v| {
+                                    let sh = self.shape_of_expr(&cst, v);
+                                    let ty = self.ty_of_expr(&cst, v);
+                                    let mut os = HashSet::new();
+                                    self.collect_sharing_origins_expr(
+                                        &cst, v, origins, shadowed, &mut os,
+                                    );
+                                    (sh, ty, os)
+                                })
+                                .collect()
+                        };
+                        let (origins, shadowed, _) = scope_stack.last_mut().unwrap();
                         for (t, (sh, ty, mut s)) in targets.iter().zip(rhs_sets) {
                             match &t.kind {
                                 PlaceKind::Ident(name) => {
@@ -4822,6 +5171,7 @@ impl<'a> Checker<'a> {
                                 PlaceKind::Field { .. } | PlaceKind::Index { .. } => {
                                     let root = t.root();
                                     if !root.is_empty() && !s.is_empty() {
+                                        shadowed.remove(root);
                                         origins.entry(root.to_string()).or_default().extend(s);
                                     }
                                 }
@@ -4831,33 +5181,96 @@ impl<'a> Checker<'a> {
                     } else if values.len() == 1 && targets.len() > 1 {
                         let shapes = self.multi_value_shapes(&cst, &values[0], targets.len());
                         let mut base_o = HashSet::new();
-                        self.collect_sharing_origins_expr(
-                            &cst,
-                            &values[0],
-                            &origins,
-                            &shadowed,
-                            &mut base_o,
-                        );
+                        {
+                            let (origins, shadowed, _) = scope_stack.last().unwrap();
+                            self.collect_sharing_origins_expr(
+                                &cst,
+                                &values[0],
+                                origins,
+                                shadowed,
+                                &mut base_o,
+                            );
+                        }
+                        let (origins, shadowed, _) = scope_stack.last_mut().unwrap();
                         for (t, sh) in targets.iter().zip(shapes) {
-                            if let PlaceKind::Ident(name) = &t.kind {
-                                if self.shape_may_share(&sh)
-                                    || matches!(sh, TypeShape::Unknown | TypeShape::Array(_))
-                                {
-                                    let mut s = base_o.clone();
-                                    if s.is_empty() {
-                                        s.insert(format!("rebind:{idx}:{name}"));
+                            match &t.kind {
+                                PlaceKind::Ident(name) => {
+                                    if self.shape_may_share(&sh)
+                                        || matches!(sh, TypeShape::Unknown | TypeShape::Array(_))
+                                    {
+                                        let mut s = base_o.clone();
+                                        if s.is_empty() {
+                                            s.insert(format!("rebind:{idx}:{name}"));
+                                        }
+                                        origins.insert(name.clone(), s);
+                                        shadowed.remove(name);
+                                    } else {
+                                        origins.remove(name);
+                                        shadowed.insert(name.clone());
                                     }
-                                    origins.insert(name.clone(), s);
-                                    shadowed.remove(name);
-                                } else {
-                                    origins.remove(name);
-                                    shadowed.insert(name.clone());
                                 }
+                                PlaceKind::Field { .. } | PlaceKind::Index { .. } => {
+                                    let root = t.root();
+                                    if !root.is_empty() && !base_o.is_empty() {
+                                        shadowed.remove(root);
+                                        origins
+                                            .entry(root.to_string())
+                                            .or_default()
+                                            .extend(base_o.iter().cloned());
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
+                Stmt::For {
+                    kind: ForKind::Iterate { vars, iter, .. },
+                    ..
+                } => {
+                    let iter_shape = self.shape_of_expr(&cst, iter);
+                    let mut base_o = HashSet::new();
+                    {
+                        let (origins, shadowed, _) = scope_stack.last().unwrap();
+                        self.collect_sharing_origins_expr(&cst, iter, origins, shadowed, &mut base_o);
+                    }
+                    let (origins, shadowed, locals) = scope_stack.last_mut().unwrap();
+                    for (i, v) in vars.iter().enumerate() {
+                        if v == "_" {
+                            continue;
+                        }
+                        let var_shape = match (&iter_shape, vars.len(), i) {
+                            (TypeShape::Slice(elem), 1, 0) => (**elem).clone(),
+                            (TypeShape::Slice(elem), _, 1) => (**elem).clone(),
+                            (TypeShape::Slice(_), _, 0) => TypeShape::Scalar,
+                            (TypeShape::Array(elem), 1, 0) => (**elem).clone(),
+                            (TypeShape::Array(elem), _, 1) => (**elem).clone(),
+                            (TypeShape::Array(_), _, 0) => TypeShape::Scalar,
+                            (TypeShape::Map(k, _), _, 0) => (**k).clone(),
+                            (TypeShape::Map(_, val), _, 1) => (**val).clone(),
+                            (TypeShape::Chan(elem), _, 0) => (**elem).clone(),
+                            (TypeShape::Unknown, _, _) => TypeShape::Unknown,
+                            _ => TypeShape::Scalar,
+                        };
+                        self.define_binding(&mut cst, v, var_shape.clone(), None, false, false, false);
+                        locals.insert(v.clone());
+                        if self.shape_may_share(&var_shape)
+                            || matches!(var_shape, TypeShape::Unknown | TypeShape::Array(_))
+                        {
+                            let mut s = base_o.clone();
+                            if s.is_empty() {
+                                s.insert(format!("local:{idx}:{v}"));
+                            }
+                            origins.insert(v.clone(), s);
+                            shadowed.remove(v);
+                        } else {
+                            origins.remove(v);
+                            shadowed.insert(v.clone());
+                        }
+                    }
+                }
                 Stmt::Return { values, .. } => {
+                    let (origins, shadowed, _) = scope_stack.last().unwrap();
                     let sets: Vec<HashSet<String>> = if values.is_empty() {
                         if typed_results.len() < 2 {
                             continue;
@@ -4878,7 +5291,7 @@ impl<'a> Checker<'a> {
                                 } else {
                                     let mut os = HashSet::new();
                                     self.collect_sharing_origins_expr(
-                                        &cst, v, &origins, &shadowed, &mut os,
+                                        &cst, v, origins, shadowed, &mut os,
                                     );
                                     os
                                 }
@@ -6709,6 +7122,12 @@ impl<'a> Checker<'a> {
                     return true;
                 }
             }
+            let mut op_roots = Vec::new();
+            collect_ref_roots(addr_op, &mut op_roots);
+            collect_addr_of_roots(addr_op, &mut op_roots);
+            if op_roots.iter().any(|r| aliases.contains(r)) {
+                return true;
+            }
         }
         if let Some(r) = inner.root_ident() {
             if aliases.contains(r) {
@@ -6717,6 +7136,7 @@ impl<'a> Checker<'a> {
         }
         let mut roots = Vec::new();
         collect_ref_roots(inner, &mut roots);
+        collect_addr_of_roots(inner, &mut roots);
         collect_move_ident_sources(inner, &mut roots);
         roots.iter().any(|r| aliases.contains(r))
     }
@@ -8629,5 +9049,126 @@ fn main() {
             "expected HYB-E3103 for parenthesized &(x) stored in struct field"
         );
     }
+
+    #[test]
+    fn interprocedural_const_return_and_shared_return_respect_scopes_and_for_iterate() {
+        let src_const_for = "\
+const SHARED = []map[string]int{{\"k\": 1}}
+
+fn leak_via_for() map[string]int {
+    for _, m in SHARED {
+        return m
+    }
+    return map[string]int{}
 }
 
+fn main() {
+    m := leak_via_for()
+    m[\"k\"] = 42
+}
+";
+        assert!(
+            check_codes(src_const_for).iter().any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 when mutating const map returned via for-iterate"
+        );
+
+        let src_const_branch_shadow = "\
+const SHARED = []map[string]int{{\"k\": 1}}
+
+fn leak_after_shadow(flag bool) []map[string]int {
+    if flag {
+        SHARED := []map[string]int{{\"local\": 0}}
+        return SHARED
+    }
+    return SHARED
+}
+
+fn main() {
+    s := leak_after_shadow(false)
+    s[0][\"k\"] = 77
+}
+";
+        assert!(
+            check_codes(src_const_branch_shadow)
+                .iter()
+                .any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 when mutating const returned after branch-local shadowing"
+        );
+
+        let src_shared_for = "\
+fn pair_via_for(xs []map[string]int) (map[string]int, map[string]int) {
+    for _, v in xs {
+        return xs[0], v
+    }
+    return xs[0], xs[0]
+}
+
+fn worker(mut a map[string]int) {
+    a[\"k\"] = 2
+}
+
+fn main() {
+    xs := []map[string]int{{\"k\": 1}}
+    a, b := pair_via_for(xs)
+    task worker(move a)
+    b[\"k\"] = 3
+}
+";
+        assert!(
+            check_codes(src_shared_for).iter().any(|c| c == "HYB-E3003"),
+            "expected HYB-E3003 when moving one of two shared return values unpacked via for-iterate"
+        );
+
+        let src_a3_field_alias = "\
+struct holder {
+    m map[string]int
+}
+
+fn rehash_via_field(m map[string]int) {
+    var h holder
+    h.m = m
+    h.m[\"other\"] = 99
+}
+
+fn main() {
+    m := map[string]int{\"k\": 1}
+    p := &m[\"k\"]
+    rehash_via_field(m)
+    println(*p)
+}
+";
+        assert!(
+            check_codes(src_a3_field_alias)
+                .iter()
+                .any(|c| c == "HYB-E3102"),
+            "expected HYB-E3102 when callee mutates map parameter via struct field alias during live map-slot loan"
+        );
+
+        let src_const_addr_holder = "\
+struct item {
+    v int
+}
+
+struct ptr_holder {
+    p *item
+}
+
+const ITEMS = map[string]item{\"k\": item{v: 1}}
+
+fn mutate_via_holder(m map[string]item) {
+    h := ptr_holder{p: &m[\"k\"]}
+    h.p.v = 99
+}
+
+fn main() {
+    mutate_via_holder(ITEMS)
+}
+";
+        assert!(
+            check_codes(src_const_addr_holder)
+                .iter()
+                .any(|c| c == "HYB-E3006"),
+            "expected HYB-E3006 when callee mutates const parameter via &m[k] stored in struct literal"
+        );
+    }
+}
